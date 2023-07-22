@@ -984,7 +984,7 @@ class CppCodeCache:
 
 
 class PyCodeCache:
-    cache = dict()
+    cache: Dict[Any, types.ModuleType] = dict()
     linemaps = dict()
     clear = staticmethod(cache.clear)
 

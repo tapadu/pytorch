@@ -2,7 +2,19 @@ import dataclasses
 import queue
 import time
 import warnings
-from typing import Any, Dict, List
+from multiprocessing import Queue
+from multiprocessing.process import BaseProcess
+from typing import (
+    Any,
+    cast,
+    Dict,
+    List,
+    Optional,
+    overload,
+    Tuple,
+    TYPE_CHECKING,
+    Union,
+)
 
 import torch
 from torch import multiprocessing
@@ -11,10 +23,11 @@ from torch._dynamo.testing import rand_strided
 from torch._inductor import ir
 from torch._inductor.codecache import PyCodeCache
 
+if TYPE_CHECKING:
+    from torch._inductor.select_algorithm import TritonTemplateCaller
+
 from .utils import do_bench
 from .virtualized import V
-
-DEBUG = False
 
 DEBUG = False
 EXIT_HANDLER_REGISTERED = False
@@ -31,12 +44,15 @@ class Pong:
 
 @dataclasses.dataclass
 class TuningProcess:
-    process: multiprocessing.Process = None
-    request_queue: multiprocessing.Queue = None
-    response_queue: multiprocessing.Queue = None
+    process: Optional[BaseProcess] = None
+    request_queue: Optional[Queue] = None
+    response_queue: Optional[Queue] = None
 
     @staticmethod
-    def process_main(request_queue, response_queue):
+    def process_main(
+        request_queue: Queue,
+        response_queue: Queue,
+    ) -> None:
         print("enter child process main")
         while True:
             obj = request_queue.get()
@@ -50,14 +66,14 @@ class TuningProcess:
             else:
                 raise RuntimeError(f"Invalid request type {type(obj)}")
 
-    def valid(self):
+    def valid(self) -> bool:
         return (
             self.process is not None
             and self.request_queue is not None
             and self.response_queue is not None
         )
 
-    def clear(self):
+    def clear(self) -> None:
         self.process = self.request_queue = self.response_queue = None
 
     def initialize(self):
@@ -95,13 +111,16 @@ class TuningProcess:
         resp = self.response_queue.get()
         assert isinstance(resp, Pong)
 
-    def terminate(self):
+    def terminate(self) -> None:
         if self.valid():
-            self.request_queue.put(None)
-            self.process.join()
+            cast(Queue, self.request_queue).put(None)
+            cast(BaseProcess, self.process).join()
 
 
 tuning_process = TuningProcess()
+
+
+LayoutOrBuffer = Union[ir.Layout, ir.Buffer]
 
 
 @dataclasses.dataclass
@@ -112,6 +131,18 @@ class TensorMeta:
     strides: List[int]
     offset: int
 
+    @overload
+    @classmethod
+    def from_irnodes(cls, irnodes: LayoutOrBuffer) -> "TensorMeta":
+        ...
+
+    @overload
+    @classmethod
+    def from_irnodes(
+        cls, irnodes: Union[Tuple[LayoutOrBuffer, ...], List[LayoutOrBuffer]]
+    ) -> List["TensorMeta"]:
+        ...
+
     @classmethod
     def from_irnodes(cls, irnodes):
         if isinstance(irnodes, (tuple, list)):
@@ -121,9 +152,12 @@ class TensorMeta:
         if isinstance(node, ir.Layout):
             node = ir.Buffer("fake", node)
 
+        dtype = node.get_dtype()
+        assert dtype is not None
+
         return TensorMeta(
             device=node.get_device(),
-            dtype=node.get_dtype(),
+            dtype=dtype,
             sizes=V.graph.sizevars.size_hints(node.get_size()),
             strides=V.graph.sizevars.size_hints(node.get_stride()),
             offset=V.graph.sizevars.size_hint(node.get_layout().offset),
@@ -157,7 +191,9 @@ class BenchmarkRequest:
     input_tensors: List[TensorMeta]
     output_tensor: TensorMeta
 
-    def benchmark(self, *input_tensors, output_tensor=None) -> float:
+    def benchmark(
+        self, *input_tensors: torch.Tensor, output_tensor: Optional[torch.Tensor] = None
+    ) -> float:
         if DEBUG:
             start_ts = time.time()
 
@@ -171,7 +207,7 @@ class BenchmarkRequest:
         # create args and out tensor
         if output_tensor is None:
             assert len(input_tensors) == 0
-            input_tensors = [x.to_tensor() for x in self.input_tensors]
+            input_tensors = tuple(x.to_tensor() for x in self.input_tensors)
             output_tensor = self.output_tensor.to_tensor()
 
         if DEBUG:
@@ -201,7 +237,7 @@ class BenchmarkRequest:
 
 
 def benchmark_in_sub_process(
-    choice: "ChoiceCaller",
+    choice: "TritonTemplateCaller",
 ) -> float:
     """
     Do benchmarking in subprocess and return the perf number (latency).
@@ -210,13 +246,13 @@ def benchmark_in_sub_process(
     tuning_process.initialize()
     assert tuning_process.valid()
 
-    tuning_process.request_queue.put(choice.bmreq)
+    cast(Queue, tuning_process.request_queue).put(choice.bmreq)
 
     while True:
         try:
-            timing = tuning_process.response_queue.get(timeout=1.0)
+            timing = cast(Queue, tuning_process.response_queue).get(timeout=1.0)
         except queue.Empty:
-            status = tuning_process.process.exitcode
+            status = cast(BaseProcess, tuning_process.process).exitcode
             if status is None:
                 # child process is still running
                 continue
