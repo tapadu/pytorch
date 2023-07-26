@@ -34,6 +34,7 @@ from torch import (  # noqa: F401
 )
 from torch._guards import ShapeGuard, Source, TracingContext, detect_fake_mode
 from torch.utils._sympy.functions import FloorDiv, LShift, Mod, RShift
+from torch.utils._sympy.solve import try_solve
 from torch.utils._sympy.value_ranges import bound_sympy, SymPyValueRangeAnalysis, ValueRanges, ValueRangeError
 from torch.utils._traceback import format_frame
 from torch._utils_internal import signpost_event
@@ -3180,12 +3181,9 @@ Target Guards:
                 floor_div_atoms = lhs.atoms(FloorDiv).union(rhs.atoms(FloorDiv))
                 if len(floor_div_atoms) > 0 and any(a.divisor != 1 for a in floor_div_atoms):
                     raise NotImplementedError
-                solutions = sympy.solve(lhs - rhs, free[0], dict=True)
-                if len(solutions) != 1:
-                    return
-                solution = solutions[0][free[0]]
-                if all(t.is_integer for t in sympy.preorder_traversal(solution)):
-                    new_var = self._find(solution)
+                r = try_solve(expr, free[0])
+                if r is not None and all(t.is_integer for t in sympy.preorder_traversal(r[1])):
+                    new_var = self._find(r[1])
                     self._set_replacement(cast(sympy.Symbol, free[0]), new_var)
             except NotImplementedError:
                 pass
@@ -3195,8 +3193,8 @@ Target Guards:
         if expr.has(Mod):
             mod_expr = tuple(expr.atoms(Mod))[0]
             try:
-                solutions = sympy.solve(lhs - rhs, mod_expr, dict=True)
-                if len(solutions) == 1 and solutions[0][mod_expr] == 0:
+                r = try_solve(expr, mod_expr)
+                if r is not None and r[1] == 0:
                     self.divisible.add(mod_expr)
             except NotImplementedError:
                 pass
@@ -3371,62 +3369,25 @@ Target Guards:
     #   2. Compute the value range of the right-hand side
     #   3. Update the value range of the variable, if better
     def refine_ranges(self, guard: ShapeGuard) -> None:
-        def simplify(expr: sympy.Expr) -> sympy.Expr:
-            """
-            Simplification specialized for range refinement.
-            """
-            return self.try_isolate_symbol_lhs(self.simplify(expr))
+        expr = self.simplify(guard.expr)
 
-        def simplify_until(expr: sympy.Expr, max_iterations: int = 10) -> sympy.Expr:
-            """
-            Calls 'simplify' either until it does not change or until it reaches the
-            maximum number of iterations.
-            """
-            for _ in range(max_iterations):
-                previous, expr = expr, simplify(expr)
-                if expr == previous:
-                    break
-            return expr
+        for symbol in expr.free_symbols:
+            assert isinstance(symbol, sympy.Symbol)
 
-        RELOP_MIRROR = {
-            sympy.Ge: sympy.Le,
-            sympy.Gt: sympy.Lt,
-            sympy.Le: sympy.Ge,
-            sympy.Lt: sympy.Gt,
-        }
+            r = try_solve(expr, symbol)
 
-        # List of expressions to be processed.
-        # Here, we try considering both LHS and RHS by mirroring the
-        # original expression: a < b ==> b > a
-        exprs = [guard.expr]
-
-        if type(guard.expr) in RELOP_MIRROR:
-            exprs.append(RELOP_MIRROR[type(guard.expr)](guard.expr.rhs, guard.expr.lhs))  # type: ignore[arg-type]
-
-        for expr in exprs:
-            # First, try to simplify the left-hand side.
-            expr = simplify_until(expr)
-
-            # Filter the guards that are not:
-            #   1. are relational operations
-            #   2. have a symbol as the left-hand side
-            #   3. already have a range
-            if not (
-                isinstance(expr, sympy.Rel)
-                and isinstance(expr.lhs, sympy.Symbol)
-                and expr.lhs in self.var_to_range
-            ):
+            if r is None or not (symbol.is_integer and r[1].is_integer):
+                # Range refinement only supports integer symbols for now.
+                # There are lots of SymPy bugs when it comes to comparing
+                # reals and integers, so we skip that for now.
                 continue
 
-            # Update the value range of the left-hand side, if the
-            # right-hand side provides a better range.
-            symbol = expr.lhs
-
+            r_expr, rhs = r
             vr = self.var_to_range[symbol]
             lower, upper = vr.lower, vr.upper
 
-            rhs_vr = bound_sympy(expr.rhs, self.var_to_range)
-            _assert_bound_is_rational(expr.rhs, rhs_vr)
+            rhs_vr = bound_sympy(rhs, self.var_to_range)
+            _assert_bound_is_rational(rhs, rhs_vr)
             lower_guard, upper_guard = self.var_to_guards.get(symbol, (None, None))
 
             # Let's suppose that we have a preexisting range for x [0, 100].
@@ -3438,13 +3399,13 @@ Target Guards:
             # sympy.Eq may update both lower and upper bounds.
             # sympy.G{t,e} may update the lower bound, only.
             # sympy.L{t,e} may update the upper bound, only.
-            if lower < rhs_vr.lower and isinstance(expr, (sympy.Eq, sympy.Ge, sympy.Gt)):
+            if lower < rhs_vr.lower and isinstance(r_expr, (sympy.Eq, sympy.Ge, sympy.Gt)):
                 # Strictly greater relations allow us to refine a bit more, since
                 # x < y implies that the lower bound for x is: y + 1.
-                lower = rhs_vr.lower + int(isinstance(expr, sympy.Gt))
+                lower = rhs_vr.lower + int(isinstance(r_expr, sympy.Gt))
                 lower_guard = guard
-            if upper > rhs_vr.upper and isinstance(expr, (sympy.Eq, sympy.Le, sympy.Lt)):
-                upper = rhs_vr.upper - int(isinstance(expr, sympy.Lt))
+            if upper > rhs_vr.upper and isinstance(r_expr, (sympy.Eq, sympy.Le, sympy.Lt)):
+                upper = rhs_vr.upper - int(isinstance(r_expr, sympy.Lt))
                 upper_guard = guard
 
             # Do nothing if the new value range is no better than what we already have.
