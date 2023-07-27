@@ -123,6 +123,11 @@ class OnnxFunctionDispatcher:
             node, diagnostic_context
         )
 
+        # If the input has complex dtype, we will only dispatch to the complex functions.
+        default_and_custom_functions = self._filter_or_keep_complex(
+            node, default_and_custom_functions, onnx_args, diagnostic_context
+        )
+
         # If there are overloaded functions available, we will find one that perfect or
         # nearest matches the given arguments and keyword arguments
         return self._find_the_perfect_or_nearest_match_onnxfunction(
@@ -132,6 +137,64 @@ class OnnxFunctionDispatcher:
             onnx_kwargs,
             diagnostic_context,
         )
+
+    @_beartype.beartype
+    @diagnostics.diagnose_call(
+        diagnostics.rules.find_operator_overloads_in_onnx_registry,
+        diagnostic_message_formatter=_find_operator_overloads_in_onnx_registry_disagnostic_message_formatter,
+    )
+    def _filter_or_keep_complex(
+        self,
+        node,
+        default_and_custom_functions: List[registration.SymbolicFunction],
+        onnx_args: Sequence[
+            Optional[Union[fx_type_utils.TensorLike, str, int, float, bool, list]]
+        ],
+        diagnostic_context: diagnostics.DiagnosticContext,
+    ) -> List[registration.SymbolicFunction]:
+        if any(
+            torch.is_complex(arg.meta["val"])
+            for arg in node.args
+            if isinstance(arg, torch.fx.Node)
+            and "val" in arg.meta
+            and isinstance(arg.meta["val"], torch.Tensor)
+        ):
+            default_and_custom_functions = [
+                func for func in default_and_custom_functions if func.is_complex
+            ]
+            # If we can't find the complex function group, raise error.
+            if not default_and_custom_functions:
+                op_full_name = self._get_aten_name(
+                    node, diagnostic_context
+                ).qualified_name()
+                diagnostic = diagnostics.UnsupportedFxNodeDiagnostic(
+                    diagnostics.rules.no_symbolic_function_for_call_function,
+                    diagnostics.levels.ERROR,
+                    f"Cannot find any COMPLEX symbolic function for {op_full_name}, "
+                    f"which should be registered under {node.target}.",
+                    unsupported_fx_node=node,
+                )
+                diagnostic_context.log(diagnostic)
+                raise diagnostics.RuntimeErrorWithDiagnostic(diagnostic)
+        else:
+            default_and_custom_functions = [
+                func for func in default_and_custom_functions if not func.is_complex
+            ]
+            # If we can't find the complex function group, raise error.
+            if not default_and_custom_functions:
+                op_full_name = self._get_aten_name(
+                    node, diagnostic_context
+                ).qualified_name()
+                diagnostic = diagnostics.UnsupportedFxNodeDiagnostic(
+                    diagnostics.rules.no_symbolic_function_for_call_function,
+                    diagnostics.levels.ERROR,
+                    f"Can ONLY find COMPLEX symbolic function for {op_full_name}, "
+                    f"which should be registered under {node.target}.",
+                    unsupported_fx_node=node,
+                )
+                diagnostic_context.log(diagnostic)
+                raise diagnostics.RuntimeErrorWithDiagnostic(diagnostic)
+        return default_and_custom_functions
 
     @_beartype.beartype
     @diagnostics.diagnose_call(
@@ -191,7 +254,11 @@ class OnnxFunctionDispatcher:
         # that is custom first
         symbolic_function_list: List[registration.SymbolicFunction] = sorted(
             overload_match_ranking,
-            key=lambda k: (overload_match_ranking[k], k.is_custom),
+            key=lambda k: (
+                overload_match_ranking[k],
+                k.is_custom,
+                k.onnx_function.name,
+            ),
             reverse=True,
         )
         return symbolic_function_list[0].onnx_function
