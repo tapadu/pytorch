@@ -389,8 +389,8 @@ void set_custom_device_index(c10::DeviceIndex device_index) {
 
 
 struct TORCH_API FooHooksInterface : public at::PrivateUse1HooksInterface {
-    virtual ~FooHooksInterface() = default;
-    const at::Generator& getDefaultGenerator(c10::DeviceIndex device_index) {
+    ~FooHooksInterface() override = default;
+    const at::Generator& getDefaultGenerator(c10::DeviceIndex device_index) override {
       static auto device_gen = make_generator_privateuse1(device_index);
       return device_gen;
     }
